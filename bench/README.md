@@ -16,3 +16,7 @@ in `parity/`.
 `bench/run` retains the detailed Rails/Rust HTTP, Action Cable and upload comparison,
 using the shared validated client. Its default results directory is ignored `tmp/bench`.
 Historical results preserve the commands and evidence used at the time.
+
+The [cached-response audit](../plans/cached-response-audit.md) compares the Rust and C# hot paths,
+documents the controlled before/after results, and explains `bench/cached-response`,
+`bench/cached-report` and `bench/cached-alloc`.

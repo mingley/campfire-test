@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Controlled native cached-read comparison. See plans/cached-response-audit.md.
+
+Uses the shared load generator and its independent SQL/body contracts, not status-only
+benchlib requests. Supply --target LABEL=EXECUTABLE once per variant, adding --dotnet
+for a published C# JIT apphost. All artifacts, including cookies, stay in ignored tmp/.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import benchlib as b
+
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument("--target", action="append", required=True, help="LABEL=EXECUTABLE")
+p.add_argument("--dotnet", action="append", default=[], help="labels of C# JIT apphosts")
+p.add_argument("--dotnet-root", default=str(Path(b.ROOT).parent / "once-campfire-dotnet"))
+p.add_argument("--reps", type=int, default=3)
+p.add_argument("--secs", type=int, default=20)
+p.add_argument("--warmup", type=int, default=5)
+p.add_argument("--concs", default="16,64")
+p.add_argument("--routes", default="room_show,messages_page,sidebar,search")
+p.add_argument("--out", required=True)
+p.add_argument("--profile", action="store_true", help="separate diagnostic run; never use its timing as a benchmark")
+a = p.parse_args()
+out = Path(a.out).resolve()
+out.mkdir(parents=True, exist_ok=False)
+targets = dict(item.split("=", 1) for item in a.target)
+seed = str(out / "seed")
+labels = b.snapshot_seed(seed)
+metadata = {
+    "server_cpus": b.SERVER_CPUS, "loadgen_cpus": b.LOADGEN_CPUS,
+    "cpu_max": Path("/sys/fs/cgroup/cpu.max").read_text().strip(),
+    "verification_revision": subprocess.check_output(["git", "-C", b.VERIFICATION_ROOT, "rev-parse", "HEAD"], text=True).strip(),
+    "targets": {k: str(Path(v).resolve()) for k, v in targets.items()},
+    "warmup_seconds": a.warmup, "window_seconds": a.secs,
+    "concurrencies": a.concs, "routes": a.routes,
+    "profile": a.profile,
+    "rust_candidate_commit": subprocess.check_output(["git", "-C", b.ROOT, "rev-parse", "HEAD"], text=True).strip(),
+    "seed_sha256": hashlib.file_digest(open(Path(seed) / "db/production.sqlite3", "rb"), "sha256").hexdigest(),
+    "binary_sha256": {k: hashlib.file_digest(open(v, "rb"), "sha256").hexdigest() for k, v in targets.items()},
+}
+for label in a.dotnet:
+    dll = Path(targets[label]).resolve().parent / "campfire.dll"
+    metadata.setdefault("dotnet_dll_sha256", {})[label] = hashlib.file_digest(dll.open("rb"), "sha256").hexdigest()
+(out / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+
+def start(label, binary):
+    env = b.app_env()
+    workers = subprocess.check_output(["taskset", "-c", b.SERVER_CPUS, "nproc"], text=True).strip()
+    env.update(LD_LIBRARY_PATH=os.environ.get("LD_LIBRARY_PATH", ""), TOKIO_WORKER_THREADS=workers, CAMPFIRE_LOG="error")
+    if a.profile and label not in a.dotnet:
+        env.update(CPUPROFILE=str(out / f"{label}-{rep}.cpu"), CPUPROFILESIGNAL="12",
+                   CPUPROFILE_FREQUENCY="1000", TCMALLOC_STACKTRACE_METHOD="libgcc")
+        os.environ["NATIVE_RUN_PRELOAD"] = os.environ["LIBPROFILER"]
+    if label not in a.dotnet:
+        os.environ["NATIVE_RUN_BIN"] = str(Path(binary).resolve())
+        if not a.profile:
+            os.environ.pop("NATIVE_RUN_PRELOAD", None)
+        return b.start("native-run", seed, env)
+    storage = b.fresh_storage(seed)
+    env = dict(os.environ, **env)
+    env.update(HTTP_PORT=str(b.PORT), TARGET_PORT=str(b.PORT + 1), CAMPFIRE_STORAGE_PATH=storage,
+               CAMPFIRE_FRONT_SERVER="1",
+               CAMPFIRE_REFERENCE_DIR=str(Path(a.dotnet_root).resolve() / "reference"),
+               CAMPFIRE_VENDOR_ASSETS_DIR=str(Path(a.dotnet_root).resolve() / "vendor/assets"),
+               CAMPFIRE_PUBLIC_PATH=str(Path(a.dotnet_root).resolve() / "reference/public"),
+               Logging__LogLevel__Default="Warning")
+    log = open(Path(b.WORK) / "app.log", "w")
+    proc = subprocess.Popen(["taskset", "-c", b.SERVER_CPUS, str(Path(binary).resolve()), "server"], cwd=b.WORK, env=env, stdout=log, stderr=log)
+    app = b.App(label, proc)
+    try:
+        app.cold_start_s = b.wait_up(app.base)
+        app.discover()
+        return app
+    except Exception:
+        app.stop()
+        raise
+
+
+for rep in range(1, a.reps + 1):
+    order = list(targets)
+    if rep % 2 == 0:
+        order.reverse()
+    for label in order:
+        app = start(label, targets[label])
+        result = {"label": label, "app": label, "rep": rep, "profile": a.profile, "load_start": b.loadavg(), "http": []}
+        try:
+            sess = b.session(app, labels)
+            directory = out / f"{label}-{rep}-contracts"
+            prepared = subprocess.run([
+                os.environ.get("RUBY", "ruby"), str(Path(b.VERIFICATION_ROOT) / "bench/contracts.rb"),
+                app.base, sess["cookie"], str(Path(b.WORK) / "storage/db/production.sqlite3"),
+                str(Path(seed) / "labels.json"), sess["css"], str(directory),
+            ], capture_output=True, text=True)
+            if prepared.returncode:
+                print(prepared.stderr[-2000:], file=sys.stderr)
+                raise SystemExit(prepared.returncode)
+            contract = json.loads(prepared.stdout)
+            assert all(contract["preflight"][route]["encoding"] == "gzip" for route in a.routes.split(",")), "preflight did not negotiate gzip"
+            result["preflight"] = contract["preflight"]
+            for route in a.routes.split(","):
+                args = [*b.routes(sess)[route], "--validate", contract["contracts"][route]]
+                for conc in map(int, a.concs.split(",")):
+                    b.http(app, sess, args, conc, a.warmup)
+                    trace = None
+                    if a.profile:
+                        if label in a.dotnet:
+                            path = out / f"{label}-{rep}-{route}-{conc}.nettrace"
+                            trace_log = open(str(path) + ".log", "w")
+                            trace = subprocess.Popen(["dotnet-trace", "collect", "-p", str(app.proc.pid), "--providers",
+                                "Microsoft-DotNETCore-SampleProfiler:0:5,Microsoft-Windows-DotNETRuntime:0x1:5",
+                                "--duration", f"00:00:{a.secs + 5:02d}", "--buffering-mode", "Block", "-o", str(path)], stdout=trace_log, stderr=trace_log)
+                            time.sleep(2)
+                        else:
+                            import signal
+                            os.kill(app.proc.pid, signal.SIGUSR2)
+                    started = time.time_ns() // 1000
+                    row = b.http(app, sess, args, conc, a.secs)
+                    row.update(route=route, conc=conc, started_unix_us=started, ended_unix_us=time.time_ns() // 1000)
+                    if trace:
+                        assert trace.wait(timeout=30) == 0, "trace collection failed"
+                    elif a.profile:
+                        os.kill(app.proc.pid, signal.SIGUSR2)
+                    assert row["validation"] == "route-contract-v1" and row["errors"] == 0 and row["invalid_responses"] == 0
+                    assert row["ok"] > 0 and row["statuses"] == {"200": row["ok"]}
+                    generator_capacity = int(subprocess.check_output(["taskset", "-c", b.LOADGEN_CPUS, "nproc"], text=True))
+                    row["generator_utilization"] = row["cpu_cores"]["loadgen"] / generator_capacity
+                    assert row["generator_utilization"] < .85, "generator-limited sample"
+                    result["http"].append(row)
+                    b.log(label, rep, route, conc, row["rps"], row["cpu_ms_per_req"], "validated")
+        except BaseException:
+            result["failed"] = True
+            raise
+        finally:
+            app.stop()
+            shutil.copyfile(Path(b.WORK) / "app.log", out / f"{label}-{rep}.log")
+            (out / f"{label}-{rep}.json").write_text(json.dumps(result, indent=2))

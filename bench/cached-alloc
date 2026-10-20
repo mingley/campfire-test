@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Count Rust/jemalloc allocations in a separate diagnostic build (not a timing run).
+
+Build with --features tikv-jemallocator/profiling,tikv-jemallocator/stats.
+The application uses prefixed jemalloc; system LD_PRELOAD jemalloc misses its allocations.
+Compare identical login, scrape and 100 warm requests against the same plus N requests.
+Includes Rust allocations only; SQLite's libc allocations are outside this allocator.
+"""
+import argparse
+import json
+import os
+import re
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import benchlib as b
+
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument("--binary", required=True)
+p.add_argument("--requests", type=int, default=10000)
+p.add_argument("--route", choices=["room_show", "sidebar"], default="sidebar")
+p.add_argument("--out", required=True)
+p.add_argument("--libc-counter", help="optional Linux/glibc malloc-count.so")
+a = p.parse_args()
+assert a.requests > 0
+out = Path(a.out).resolve()
+out.mkdir(parents=True, exist_ok=False)
+seed = str(out / "seed")
+labels = b.snapshot_seed(seed)
+os.environ["NATIVE_ALLOC_BIN"] = str(Path(a.binary).resolve())
+if a.libc_counter:
+    os.environ["NATIVE_ALLOC_PRELOAD"] = str(Path(a.libc_counter).resolve())
+counts = {}
+profiles = {}
+libc_counts = {}
+for n in (0, a.requests):
+    prefix = out / f"n{n}"
+    app = b.start("native-alloc", seed, {
+        "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
+        "TOKIO_WORKER_THREADS": "2", "CAMPFIRE_LOG": "error",
+        "_RJEM_MALLOC_CONF": f"stats_print:true,stats_print_opts:J,prof:true,prof_accum:true,lg_prof_sample:0,prof_final:true,prof_prefix:{prefix}",
+    })
+    try:
+        sess = b.session(app, labels)
+        prepared = subprocess.run([
+            os.environ.get("RUBY", "ruby"), str(Path(b.VERIFICATION_ROOT) / "bench/contracts.rb"),
+            app.base, sess["cookie"], str(Path(b.WORK) / "storage/db/production.sqlite3"),
+            str(Path(seed) / "labels.json"), sess["css"], str(out / f"n{n}-contracts"),
+        ], capture_output=True, text=True)
+        if prepared.returncode:
+            print(prepared.stderr[-2000:], file=sys.stderr)
+            raise SystemExit(prepared.returncode)
+        contract = json.loads(prepared.stdout)
+        args = [*b.routes(sess)[a.route], "--validate", contract["contracts"][a.route]]
+        b.http(app, sess, args, 1, 600, ["--requests", 100])
+        if n:
+            row = b.http(app, sess, args, 1, 600, ["--requests", n])
+            assert row["errors"] == 0 and row["ok"] == n
+    finally:
+        app.stop()
+    log = (Path(b.WORK) / "app.log").read_text()
+    (out / f"n{n}.log").write_text(log)
+    begin = log.index('{\n"jemalloc"') if '{\n"jemalloc"' in log else log.index('{"jemalloc"')
+    stats = json.JSONDecoder().raw_decode(log[begin:])[0]["jemalloc"]
+    assert stats["opt"]["prof"], "bundled jemalloc profiling was not enabled"
+    merged = stats["stats.arenas"]["merged"]
+    counts[n] = {key: sum(merged[size][key] for size in ("small", "large")) for key in ("nmalloc", "nrequests")}
+    heaps = list(out.glob(f"n{n}.*.heap"))
+    assert len(heaps) == 1, "missing or ambiguous allocation-site profile"
+    match = re.search(r"t\*: \d+: \d+ \[(\d+): (\d+)\]", heaps[0].read_text())
+    assert match, "missing cumulative full-rate allocation totals"
+    profiles[n] = dict(objects=int(match[1]), bytes=int(match[2]))
+    if a.libc_counter:
+        entries = re.findall(r"CAMPFIRE_MALLOC_COUNTS (\{[^\n]+\})", log)
+        assert len(entries) == 1, "missing or ambiguous libc allocation counters"
+        libc_counts[n] = json.loads(entries[0])
+summary = {"requests": a.requests, "route": a.route, "counts": counts,
+           "measured_seconds": row["secs"],
+           "profiles": profiles,
+           "arena_allocations_per_request": (counts[a.requests]["nmalloc"] - counts[0]["nmalloc"]) / a.requests,
+           "profiled_objects_per_request": (profiles[a.requests]["objects"] - profiles[0]["objects"]) / a.requests,
+           "profiled_bytes_per_request": (profiles[a.requests]["bytes"] - profiles[0]["bytes"]) / a.requests}
+if libc_counts:
+    summary["libc_calls_per_request"] = {key: (libc_counts[a.requests][key] - libc_counts[0][key]) / a.requests for key in libc_counts[0]}
+(out / "summary.json").write_text(json.dumps(summary, indent=2))
+print(json.dumps(summary, indent=2))

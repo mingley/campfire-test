@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Report only a complete, validated three-target cached-response timing matrix."""
+import argparse
+import json
+import math
+from pathlib import Path
+from statistics import median
+
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument("directory")
+a = p.parse_args()
+root = Path(a.directory)
+metadata = json.loads((root / "metadata.json").read_text())
+assert not metadata["profile"], "diagnostic runs are not throughput evidence"
+assert set(metadata["targets"]) == {"base", "optimized", "dotnet"}
+routes = ["room_show", "messages_page", "sidebar", "search"]
+values = {}
+for label in metadata["targets"]:
+    for rep in (1, 2, 3):
+        result = json.loads((root / f"{label}-{rep}.json").read_text())
+        assert result["label"] == label and result["rep"] == rep
+        assert not result.get("failed") and not result["profile"]
+        assert len(result["http"]) == 8
+        seen = set()
+        for row in result["http"]:
+            key = (row["route"], row["conc"])
+            assert key not in seen and key[0] in routes and key[1] in (16, 64)
+            seen.add(key)
+            assert row["validation"] == "route-contract-v1"
+            assert row["errors"] == row["invalid_responses"] == 0
+            assert row["ok"] == row["latency"]["n"] > 0
+            assert row["statuses"] == {"200": row["ok"]} and row["gzip"]
+            assert 0 <= row["generator_utilization"] < .85
+            assert all(math.isfinite(value) and value > 0 for value in (row["rps"], row["cpu_ms_per_req"]["campfire"], row["avg_bytes"]))
+            values.setdefault((label, *key), []).append(row)
+
+
+def rates(label, route, conc):
+    rates = [row["rps"] for row in values[label, route, conc]]
+    return f"{median(rates):,.0f} [{min(rates):,.0f}–{max(rates):,.0f}]"
+
+
+def cpu(label, route, conc):
+    return median(row["cpu_ms_per_req"]["campfire"] * 1000 for row in values[label, route, conc])
+
+
+print("All 72 timed samples passed route/body validation; three repetitions per cell.\n")
+print("| Route | c | Rust baseline req/s [range] | Rust optimized req/s [range] | Δ req/s | CPU µs baseline → optimized | p99 ms baseline → optimized |")
+print("|---|---:|---:|---:|---:|---:|---:|")
+for route in routes:
+    for conc in (16, 64):
+        before = median(row["rps"] for row in values["base", route, conc])
+        after = median(row["rps"] for row in values["optimized", route, conc])
+        before_p99 = median(row['latency']['p99_ms'] for row in values['base', route, conc])
+        after_p99 = median(row['latency']['p99_ms'] for row in values['optimized', route, conc])
+        print(f"| {route} | {conc} | {rates('base', route, conc)} | {rates('optimized', route, conc)} | {(after/before-1)*100:+.1f}% | {cpu('base',route,conc):.1f} → {cpu('optimized',route,conc):.1f} | {before_p99:.3f} → {after_p99:.3f} |")
+print("\n| Route | c | C# ReadyToRun JIT req/s [range] | CPU µs | Median p99 ms | Encoded body bytes |")
+print("|---|---:|---:|---:|---:|---:|")
+for route in routes:
+    for conc in (16, 64):
+        rows = values["dotnet", route, conc]
+        print(f"| {route} | {conc} | {rates('dotnet',route,conc)} | {cpu('dotnet',route,conc):.1f} | {median(row['latency']['p99_ms'] for row in rows):.3f} | {median(row['avg_bytes'] for row in rows):,.0f} |")
+rows = [row for group in values.values() for row in group]
+print(f"\nTotal validated timed responses: {sum(row['ok'] for row in rows):,}. Maximum generator utilization: {max(row['generator_utilization'] for row in rows):.3f}.")
