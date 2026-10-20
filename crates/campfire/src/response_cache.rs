@@ -44,7 +44,9 @@ struct Observer {
 
 impl Observer {
     fn version(&mut self) -> rusqlite::Result<u64> {
-        let current = self.db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        // Retain the statement, not its result: each capture/lookup/admission still observes
+        // SQLite under the same mutex, including commits from other processes.
+        let current = self.db.prepare_cached("PRAGMA data_version")?.query_row([], |row| row.get(0))?;
         if current != self.data_version {
             self.generation += 1;
             self.data_version = current;
