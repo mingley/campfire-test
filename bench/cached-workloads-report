@@ -36,13 +36,23 @@ for label in m["targets"]:
                     cold.setdefault((label, c["route"]), []).extend(c["latency_ms"])
 
 print(f"{m['reps']} alternating repetitions, {m['concurrency']} read connections, {m['users']}; all requests validated and writes audited.\n")
-print("| Route | Write-rate limit/s | Read req/s preparation → early | Ratio | Achieved write/s preparation / early |")
-print("|---|---:|---:|---:|---:|")
+print("| Route | Write-rate limit/s | Read req/s preparation → early | Ratio | Achieved write/s preparation / early | Writer p99 ms preparation / early | Achieved write rates |")
+print("|---|---:|---:|---:|---:|---:|---|")
 for route in routes:
     for rate in rates:
         before, after = (median(r["read_rps"] for r in rows[label, route, rate]) for label in ("preparation", "early"))
         wb, wa = (median(r["achieved_write_rps"] for r in rows[label, route, rate]) for label in ("preparation", "early"))
-        print(f"| {route} | {rate} | {before:,.0f} → {after:,.0f} | {after / before:.2f}× | {wb:.2f} / {wa:.2f} |")
+        wp = "—"
+        matched = "no writes"
+        if rate:
+            pb, pa = (median(r["readers"][0]["writer"]["latency"]["p99_ms"] for r in rows[label, route, rate]) for label in ("preparation", "early"))
+            wp = f"{pb:.2f} / {pa:.2f}"
+            paired = zip(rows["preparation", route, rate], rows["early", route, rate])
+            similar = all(min(x["achieved_write_rps"], y["achieved_write_rps"]) /
+                          max(x["achieved_write_rps"], y["achieved_write_rps"]) >= .95 for x, y in paired)
+            matched = "within 5% each repetition" if similar else "unequal"
+        print(f"| {route} | {rate} | {before:,.0f} → {after:,.0f} | {after / before:.2f}× | {wb:.2f} / {wa:.2f} | {wp} | {matched} |")
+print("\nRates are caps, not guaranteed arrivals. Rows with unequal achieved write rates describe overload behavior and do not establish matched-write-load read speedups.\n")
 print("\nCold response-cache variants, fragments already warm, one fresh HTTP connection/request.\n")
 print("| Route | Requests/target | Median latency ms preparation → early |")
 print("|---|---:|---:|")

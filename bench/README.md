@@ -23,3 +23,8 @@ documents the controlled before/after results, and explains `bench/cached-respon
 
 The [early-hit follow-up](../plans/cached-response-early-hit.md) explains the pipeline
 and authorization-reuse gap, the next architectural change, and its matched measurements.
+
+The [cold/mixed workload validation](../plans/cached-response-pr-validation.md)
+documents `bench/cached-workloads` and `bench/cached-workloads-report`, including
+two distinct authenticated readers, independently audited writes, achieved write
+rates, writer latency and the high-write overload limitation.
