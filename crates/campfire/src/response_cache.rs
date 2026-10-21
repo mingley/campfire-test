@@ -56,7 +56,8 @@ impl Authority {
         }
         let raw = c.cookies.get("session_token")?;
         let token = rails_compat::cookies::verify_signed(&c.app().secrets, "session_token", raw, until)?;
-        (token == session.token).then_some(Self { not_before: now, until, last_room: None })
+        let last_room = c.current::<concerns::LastRoomPreference>().map(|preference| preference.0);
+        (token == session.token).then_some(Self { not_before: now, until, last_room })
     }
 }
 
@@ -170,7 +171,7 @@ impl Store {
         *response.headers_mut() = cached.headers.clone();
         response.headers_mut().insert(header::DATE, campfire_kit::clock::httpdate(now).parse().ok()?);
         if let Some(room) = authority.last_room {
-            let cookie = campfire_kit::cookies::Cookie::new(room.to_string()).expires(campfire_kit::clock::years_from(now, 20));
+            let cookie = concerns::last_room_preference_cookie(room, now);
             response.headers_mut().append(header::SET_COOKIE, campfire_kit::cookies::set_cookie_header("last_room", &cookie).parse().ok()?);
         }
         #[cfg(test)]
@@ -345,19 +346,8 @@ pub async fn completed(State(app): State<App>, mut request: axum::extract::Reque
     if let (Some(key), Some(authority)) = (early_key, ticket.authority) {
         // No session/flash/credential cookie may be replayed. The only allowed side effect is
         // a room preference, whose calendar expiry is generated anew on every hit.
-        let cookies: Vec<_> = parts.headers.get_all(header::SET_COOKIE).iter().collect();
-        let last_room = match cookies.as_slice() {
-            [] => Some(None),
-            [cookie] => cookie
-                .to_str()
-                .ok()
-                .and_then(|s| s.strip_prefix("last_room="))
-                .and_then(|s| s.split(';').next()?.parse::<i64>().ok())
-                .map(Some),
-            _ => None,
-        };
-        if let Some(last_room) = last_room {
-            let metadata = Some(Authority { last_room, ..authority });
+        if permitted_cookie_effects(&parts.headers, authority.last_room) {
+            let metadata = Some(authority);
             let fast = Ticket { key: format!("{}/{key}", ticket.generation), ..ticket.clone() };
             ticket.store.put(
                 &fast,
@@ -367,6 +357,19 @@ pub async fn completed(State(app): State<App>, mut request: axum::extract::Reque
     }
     ticket.store.put(&ticket, CachedResponse { status: parts.status, headers, body: body.clone(), variant: Vec::new(), metadata: None });
     axum::response::Response::from_parts(parts, AxumBody::from(body))
+}
+
+fn permitted_cookie_effects(headers: &HeaderMap, last_room: Option<i64>) -> bool {
+    let mut cookies = headers.get_all(header::SET_COOKIE).iter();
+    match (cookies.next(), last_room) {
+        (None, None) => true,
+        (Some(cookie), Some(room)) if cookies.next().is_none() => {
+            // Validate the final header against the recorded effect; never decode authority
+            // or a preference value from response headers. Any other cookie fails closed.
+            cookie.as_bytes().starts_with(format!("last_room={room};").as_bytes())
+        }
+        _ => false,
+    }
 }
 
 fn eligible_request(c: &Ctx) -> bool {

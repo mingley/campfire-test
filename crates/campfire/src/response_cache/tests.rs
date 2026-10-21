@@ -172,3 +172,20 @@ fn repeated_header_values_cannot_impersonate_header_boundaries() {
     separate.headers_mut().insert("x-request-id", "trace-one".parse().unwrap());
     assert_eq!(before, early_key(&separate), "only tracing is ignored");
 }
+
+#[test]
+fn early_admission_requires_recorded_cookie_effects_and_rejects_other_cookies() {
+    let mut headers = HeaderMap::new();
+    assert!(permitted_cookie_effects(&headers, None));
+    assert!(!permitted_cookie_effects(&headers, Some(42)), "a missing side effect is not silently recreated");
+    headers.append(header::SET_COOKIE, "last_room=42; path=/; samesite=lax".parse().unwrap());
+    assert!(permitted_cookie_effects(&headers, Some(42)));
+    assert!(!permitted_cookie_effects(&headers, None), "a cookie cannot invent an unrecorded effect");
+    assert!(!permitted_cookie_effects(&headers, Some(4)), "a value prefix is not a matching preference");
+    headers.append(header::SET_COOKIE, "session_token=refresh; path=/".parse().unwrap());
+    assert!(!permitted_cookie_effects(&headers, Some(42)), "credential cookies cannot be replayed or dropped");
+    headers.remove(header::SET_COOKIE);
+    headers.append(header::SET_COOKIE, "_campfire_session=flash; path=/".parse().unwrap());
+    assert!(!permitted_cookie_effects(&headers, None));
+    assert!(!permitted_cookie_effects(&headers, Some(42)));
+}
