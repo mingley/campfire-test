@@ -153,3 +153,22 @@ fn early_authority_observes_external_commits_clock_boundaries_and_fresh_cookie_d
     cache.put(&ticket, late);
     assert!(cache.early_get("early/room", &shared).is_none(), "a delayed response cannot authorize the new generation");
 }
+
+#[test]
+fn repeated_header_values_cannot_impersonate_header_boundaries() {
+    let mut separate = axum::http::Request::get("/rooms/1")
+        .header("host", "campfire.test")
+        .header("t", "value")
+        .header("turbo-frame", "room")
+        .body(AxumBody::empty())
+        .unwrap();
+    let mut embedded =
+        axum::http::Request::get("/rooms/1").header("host", "campfire.test").header("t", "value").body(AxumBody::empty()).unwrap();
+    for value in ["", "turbo-frame", "room"] {
+        embedded.headers_mut().append("t", value.parse().unwrap());
+    }
+    assert_ne!(early_key(&separate), early_key(&embedded));
+    let before = early_key(&separate);
+    separate.headers_mut().insert("x-request-id", "trace-one".parse().unwrap());
+    assert_eq!(before, early_key(&separate), "only tracing is ignored");
+}
