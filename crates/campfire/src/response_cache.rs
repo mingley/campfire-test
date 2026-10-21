@@ -263,10 +263,10 @@ fn request_key(c: &Ctx, round: &Round, user: i64, session: i64) -> Option<String
             continue;
         }
         field(name.as_str().as_bytes());
+        field(&(c.request.headers.get_all(name).iter().count() as u64).to_le_bytes());
         for value in c.request.headers.get_all(name) {
             field(value.as_bytes());
         }
-        field(b"");
     }
     if length > MAX_KEY_INPUT {
         return None;
