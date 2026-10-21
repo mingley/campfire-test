@@ -11,11 +11,11 @@ fn store(capacity: usize) -> (tempfile::TempDir, Connection, Arc<Store>) {
 
 fn ticket(store: &Arc<Store>, key: &str) -> Ticket {
     let generation = store.version().unwrap();
-    Ticket { store: store.clone(), generation, key: format!("{generation}/{key}") }
+    Ticket { store: store.clone(), generation, key: format!("{generation}/{key}"), authority: None }
 }
 
-fn response(body: impl Into<Bytes>) -> CachedResponse {
-    CachedResponse { status: StatusCode::OK, headers: HeaderMap::new(), body: body.into(), variant: Vec::new() }
+fn response(body: impl Into<Bytes>) -> CachedResponse<Option<Authority>> {
+    CachedResponse { status: StatusCode::OK, headers: HeaderMap::new(), body: body.into(), variant: Vec::new(), metadata: None }
 }
 
 #[test]
@@ -122,4 +122,34 @@ fn delayed_render_racing_a_foreign_commit_never_repopulates_the_cache() {
     barrier.wait();
     renderer.join().unwrap();
     assert_eq!(cache.get(&current).unwrap().body, "current public response");
+}
+
+#[test]
+fn early_authority_observes_external_commits_clock_boundaries_and_fresh_cookie_dates() {
+    let (_dir, writer, cache) = store(4096);
+    let now: jiff::Timestamp = "2024-06-01T12:00:00Z".parse().unwrap();
+    let clock = Arc::new(campfire_kit::clock::TestClock::frozen_at(now));
+    let shared: campfire_kit::SharedClock = clock.clone();
+    let authority = Authority { not_before: now, until: now + jiff::SignedDuration::from_secs(2), last_room: Some(42) };
+    let ticket = ticket(&cache, "early/room");
+    let mut body = response("authorized body");
+    body.metadata = Some(authority);
+    cache.put(&ticket, body);
+    let first = cache.early_get("early/room", &shared).unwrap();
+    clock.travel(jiff::SignedDuration::from_secs(1));
+    let next = cache.early_get("early/room", &shared).unwrap();
+    assert_ne!(first.headers()[header::DATE], next.headers()[header::DATE]);
+    assert_ne!(first.headers()[header::SET_COOKIE], next.headers()[header::SET_COOKIE]);
+    clock.travel(jiff::SignedDuration::from_secs(1));
+    assert!(cache.early_get("early/room", &shared).is_none(), "the exact deadline falls back for activity/credential refresh");
+    clock.travel_to(now - jiff::SignedDuration::from_secs(1));
+    assert!(cache.early_get("early/room", &shared).is_none(), "clock rollback cannot replay future authority");
+    clock.travel_to(now);
+    assert!(cache.early_get("early/room", &shared).is_some());
+    writer.execute("UPDATE records SET value = 'revoked'", []).unwrap();
+    assert!(cache.early_get("early/room", &shared).is_none());
+    let mut late = response("late old authorization");
+    late.metadata = Some(authority);
+    cache.put(&ticket, late);
+    assert!(cache.early_get("early/room", &shared).is_none(), "a delayed response cannot authorize the new generation");
 }

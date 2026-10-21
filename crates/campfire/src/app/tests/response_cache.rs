@@ -36,14 +36,62 @@ async fn room_messages_sidebar_and_search_cache_complete_responses() {
     for path in [format!("/rooms/{room}"), format!("/rooms/{room}/messages"), "/users/me/sidebar".into(), "/searches?q=hello".into()] {
         let first = warm(&test, &path, &cookie).await;
         let before = hits(&test);
+        let early = test.booted.app.response_cache.early_hits.load(Ordering::Relaxed);
         let hit = send(&test.booted.router, get_with_cookie(&path, &cookie)).await;
         assert_eq!(hits(&test), before + 1, "{path}");
+        assert_eq!(test.booted.app.response_cache.early_hits.load(Ordering::Relaxed), early + 1, "{path}");
         assert_eq!(hit.status, first.status);
         assert_eq!(hit.body, first.body);
         assert_eq!(hit.header("etag"), first.header("etag"));
         assert_ne!(hit.header("x-request-id"), first.header("x-request-id"));
         assert_eq!(hit.header("content-length"), Some(hit.body.len().to_string().as_str()));
     }
+}
+
+#[tokio::test]
+async fn expiring_credentials_never_enter_the_early_path() {
+    use campfire_kit::cookies::{Cookie, CookieJar};
+    let Some((test, cookie, _user, room)) = fixture().await else { return };
+    let path = format!("/rooms/{room}");
+    warm(&test, &path, &cookie).await;
+    let mut jar = CookieJar::from_headers([cookie.as_str()], test.booted.app.secrets.clone(), test.booted.app.clock.clone());
+    let token = jar.signed("session_token").unwrap();
+    jar.set_signed("session_token", Cookie::new(token).expires(test.booted.app.clock.now() + jiff::SignedDuration::from_secs(5))).unwrap();
+    let short = jar.set_cookie_headers(false, "campfire.test")[0].split(';').next().unwrap().to_string();
+    warm(&test, &path, &short).await;
+    let before = test.booted.app.response_cache.early_hits.load(Ordering::Relaxed);
+    assert_eq!(send(&test.booted.router, get_with_cookie(&path, &short)).await.status, StatusCode::OK);
+    assert_eq!(test.booted.app.response_cache.early_hits.load(Ordering::Relaxed), before);
+    assert_eq!(send(&test.booted.router, get_with_cookie(&path, &cookie)).await.status, StatusCode::OK);
+    assert_eq!(test.booted.app.response_cache.early_hits.load(Ordering::Relaxed), before + 1);
+}
+
+#[tokio::test]
+async fn early_hits_preserve_preference_cookies_and_reject_body_or_transport_variants() {
+    let Some((test, cookie, _user, room)) = fixture().await else { return };
+    let path = format!("/rooms/{room}");
+    let first = warm(&test, &path, &cookie).await;
+    let hit = send(&test.booted.router, get_with_cookie(&path, &cookie)).await;
+    for response in [&first, &hit] {
+        let cookies: Vec<_> = response.headers.get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(cookies.len(), 1);
+        let cookie = cookies[0].to_str().unwrap();
+        assert!(cookie.starts_with(&format!("last_room={room}; path=/; expires=")));
+        assert!(cookie.ends_with("; samesite=lax"));
+    }
+    let matching_preference = format!("{cookie}; last_room={room}");
+    warm(&test, &path, &matching_preference).await;
+    let hit = send(&test.booted.router, get_with_cookie(&path, &matching_preference)).await;
+    assert!(hit.headers.get_all(header::SET_COOKIE).iter().next().is_none());
+    let before = test.booted.app.response_cache.early_hits.load(Ordering::Relaxed);
+    let mut body = get_with_cookie(&path, &cookie);
+    *body.body_mut() = Body::from("format=json");
+    send(&test.booted.router, body).await;
+    assert_eq!(test.booted.app.response_cache.early_hits.load(Ordering::Relaxed), before);
+    let mut peer = get_with_cookie(&path, &cookie);
+    peer.extensions_mut().insert(axum::extract::ConnectInfo("192.0.2.10:12345".parse::<std::net::SocketAddr>().unwrap()));
+    assert_eq!(send(&test.booted.router, peer).await.status, StatusCode::OK);
+    assert_eq!(test.booted.app.response_cache.early_hits.load(Ordering::Relaxed), before);
 }
 
 #[tokio::test]
