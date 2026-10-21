@@ -92,7 +92,7 @@ def prepare(app, directory):
 
 
 def arguments(app, person, route, conc, secs):
-    session = {"room": labels["rooms.watercooler"], "write_room": labels["rooms.hq"], "before": labels["messages.busy_060"]}
+    session = {"room": labels["rooms.watercooler"], "write_room": labels["rooms.hq"], "before": labels["messages.busy_060"], "csrf": person["csrf"]}
     return ["taskset", "-c", b.LOADGEN_CPUS, b.LOADGEN, "http", "--base", app.base,
             "--cookie", person["cookie"], *map(str, b.routes(session)[route]), "--conc", str(conc),
             "--duration", str(secs), "--validate", person["contracts"][route]]
@@ -111,6 +111,10 @@ def audit_writes(path, expected, writer):
                 WHERE m.id=?""", (entry["id"],)).fetchone()
             assert row and row[:2] == (labels["rooms.hq"], writer["user_id"])
             assert html.unescape(row[2]).count(entry["token"]) == 1
+        # Retain a transactionally consistent SQLite snapshot beside the receipt so the
+        # persisted message IDs, creators, rooms and body tokens can be rechecked afterward.
+        with sqlite3.connect(path.with_suffix(".sqlite3")) as snapshot:
+            db.backup(snapshot)
     return len(entries)
 
 

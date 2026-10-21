@@ -21,6 +21,7 @@ for label in m["targets"]:
                 r = json.loads((root / f"{label}-{rep}-{route}-{rate}/result.json").read_text())
                 assert not r["failed"] and (r["label"], r["rep"], r["route"], r["rate_limit"]) == (label, rep, route, rate)
                 assert r["distinct_users"] == len(set(r["user_ids"])) == len(m["users"].split(","))
+                assert len(r["readers"]) == r["distinct_users"]
                 assert r["read_connections"] == m["concurrency"] and r["generator_utilization"] < .85
                 for reader in r["readers"]:
                     for request in [reader] + ([reader["writer"]] if "writer" in reader else []):
