@@ -13,6 +13,23 @@ controller metadata and uses one cookie factory for ordinary visits and early
 hits. A final response-cookie allowlist rejects unexpected, missing or mismatched
 cookie effects. Preference values are no longer inferred from response headers.
 
+## Motivation from the C# port
+
+This investigation was prompted by the recent
+[devmobasa/once-campfire-dotnet C# port](https://github.com/devmobasa/once-campfire-dotnet),
+pinned to `3286f07aa8d00b21e749b8c8c03eb3d5ad3c2ce1`. Its
+[`PageCacheHitMiddleware`](https://github.com/devmobasa/once-campfire-dotnet/blob/3286f07aa8d00b21e749b8c8c03eb3d5ad3c2ce1/src/Campfire.Web/Views/Caching/PageCacheHitMiddleware.cs),
+`PageTicketMemo` and `PageAuthorityCache` showed why it was ahead of the starting
+Rust implementation: it could reuse admitted authority and encoded responses
+before routing, while Rust rebuilt the routed context and repeated authentication
+and resource queries before reaching its response cache. Both still observed
+SQLite commits. The useful insight was where the cache hit occurred and which
+proven authority could be reused, rather than a compiler-setting difference.
+
+The Rust implementation follows that architectural insight through its existing
+signed-cookie verifier, immutable per-process secrets, SQLite generation observer
+and bounded response store. It does not copy C#'s dynamic key-ring mechanism.
+
 ## Checks
 
 805 Rust workspace tests pass, with 11 pre-existing ignored, using both
@@ -78,7 +95,26 @@ The earlier three-repeat, single-user warm-read comparison at `b314160` measured
 route/concurrency cells, with lower median p99 in every cell and 62,488,810
 validated responses. Those measurements precede the typed-cookie cleanup and
 are historical evidence for the architecture change, not a new C# measurement
-for this PR revision. See the [complete pinned study and profiling limits](https://github.com/mingley/once-campfire-rust/blob/0c4bc9137c655e4028ca10445105b3350f1ba6db/plans/cached-response-early-hit.md).
+for this PR revision. Across those eight cells, the geometric mean gain over C#
+was 62.5%, with 34.0% less server CPU/request; compared with the preceding Rust
+revision, throughput was 2.46× and CPU/request fell 59.4%. These are controlled
+warm-read results on this cloud machine, not language-wide or write-heavy claims.
+Both servers used two CPUs, the generator two separate CPUs, the same seed,
+gzip, shared route/body validation, 5-second warmups and 20-second windows. The
+published desktop hardware/private harness could not be reproduced exactly.
+
+| Route | Connections | Rust req/s | C# req/s | Rust / C# | CPU µs Rust / C# | p99 ms Rust / C# |
+|---|---:|---:|---:|---:|---:|---:|
+| room_show | 16 | 54,978 | 29,772 | 1.85× | 35.2 / 58.3 | 0.696 / 2.549 |
+| room_show | 64 | 58,906 | 40,749 | 1.45× | 33.0 / 46.4 | 2.615 / 4.175 |
+| messages_page | 16 | 65,985 | 36,333 | 1.82× | 29.4 / 48.7 | 0.582 / 1.399 |
+| messages_page | 64 | 64,186 | 40,957 | 1.57× | 30.4 / 46.0 | 2.285 / 4.047 |
+| sidebar | 16 | 66,998 | 38,420 | 1.74× | 29.0 / 44.7 | 0.597 / 1.326 |
+| sidebar | 64 | 74,278 | 50,790 | 1.46× | 26.5 / 37.2 | 2.123 / 3.197 |
+| search | 16 | 62,564 | 37,593 | 1.66× | 31.1 / 46.7 | 0.587 / 1.384 |
+| search | 64 | 68,041 | 45,030 | 1.51× | 28.7 / 41.9 | 2.261 / 3.451 |
+
+See the [complete pinned study and profiling limits](https://github.com/mingley/once-campfire-rust/blob/0c4bc9137c655e4028ca10445105b3350f1ba6db/plans/cached-response-early-hit.md).
 
 ## Results
 
@@ -118,7 +154,7 @@ from 8.52 to 10.28 ms. These are material tradeoffs alongside the read gains.
 
 At the 100/s room limit, both builds fell short of the requested rate and the
 early build completed about 24% fewer writes (60.48 versus 79.76/s), with higher
-writer p99. Its read ratio is therefore **not a matched-load speedup**. This draft
+writer p99. Its read ratio is therefore **not a matched-load speedup**. This proposal
 does not claim improvement in every case; scheduling/SQLite contention under
 room-write overload needs further investigation before recommending deployment.
 The sidebar workload at that limit maintained comparable achieved write rates.
