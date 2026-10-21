@@ -20,3 +20,6 @@ Historical results preserve the commands and evidence used at the time.
 The [cached-response audit](../plans/cached-response-audit.md) compares the Rust and C# hot paths,
 documents the controlled before/after results, and explains `bench/cached-response`,
 `bench/cached-report` and `bench/cached-alloc`.
+
+The [early-hit follow-up](../plans/cached-response-early-hit.md) explains the pipeline
+and authorization-reuse gap, the next architectural change, and its matched measurements.

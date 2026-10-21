@@ -2,11 +2,12 @@
 //!
 //! Authentication and room access run before admission. Exact request replays may reuse that
 //! authority until the database changes, the cookie expires or hourly activity is due.
-//! A separate SQLite connection observes commits from every writer; its version is captured before authentication and checked again at
-//! lookup and admission. Thus a commit during authentication or rendering cannot populate the
-//! new version with an old authorization snapshot. Cookies, flash, HEAD and conditional GET
-//! still go through the kit on a hit. Only the completed, bounded identity/gzip representation is
-//! retained; Rust's Sec-Fetch-Site protection does not put CSRF secrets in these pages.
+//! A separate SQLite connection observes commits from every writer. The generation captured
+//! before authentication is checked again at lookup and admission, so a render racing a commit
+//! cannot populate the new generation with old authorization. Each early hit observes SQLite
+//! too. Cookie side effects are regenerated; flash, HEAD and conditional GET use the kit.
+//! Only the completed, bounded identity/gzip representation is retained; Rust's Sec-Fetch-Site
+//! protection does not put CSRF secrets in these pages.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

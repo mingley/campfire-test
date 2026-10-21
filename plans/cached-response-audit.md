@@ -1,5 +1,10 @@
 # Cached HTTP response audit
 
+This records the first optimization stage at `93e2a90`. The
+[architectural follow-up](cached-response-early-hit.md) records the current result:
+Rust leads C# by 45–85% across all eight tested cached-read cases.
+
+
 ## Scope and reproducibility
 
 Rust baseline: `basecamp/once-campfire-rust` at
@@ -237,3 +242,10 @@ All 72 timed samples passed route/body validation; three repetitions per cell.
 | search | 64 | 42,830 [40,495–43,495] | 43.6 | 4.155 | 9,805 |
 
 Total validated timed responses: 41,694,806. Maximum generator utilization: 0.545.
+
+## Architectural follow-up
+
+The figures above describe the first optimization stage. See the
+[early-hit follow-up](cached-response-early-hit.md) for the subsequent comparison
+of C#’s early authenticated middleware with Rust’s routed pipeline, the bounded
+authority reuse change and its new matched results.
